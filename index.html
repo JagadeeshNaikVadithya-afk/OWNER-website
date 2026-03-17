@@ -683,14 +683,48 @@ function handleOrderUpdate(docId,order){
 }
 function startFirestoreListener(){
   const seen=new Set();
-  db.collection('orders').orderBy('placedAt','desc').limit(50)
-    .onSnapshot(snap=>{
-      snap.docChanges().forEach(change=>{
-        const docId=change.doc.id,order=change.doc.data();
-        if(change.type==='added'&&!seen.has(order.token)){seen.add(order.token);handleNewOrder(docId,order);}
-        else if(change.type==='modified') handleOrderUpdate(docId,order);
+  let retryCount=0;
+  let currentUnsub=null;
+
+  function attach(){
+    addLog('monitor','Firestore listener attached — live','ok');
+    // No orderBy = no index needed = new docs fire instantly every time
+    currentUnsub = db.collection('orders')
+      .onSnapshot({includeMetadataChanges:false}, snap=>{
+        retryCount=0;
+        snap.docChanges().forEach(change=>{
+          const docId=change.doc.id, order=change.doc.data();
+          if(!order||!order.token) return;
+          if(change.type==='added'&&!seen.has(order.token)){
+            seen.add(order.token);
+            handleNewOrder(docId,order);
+          } else if(change.type==='modified'){
+            handleOrderUpdate(docId,order);
+          }
+        });
+      }, err=>{
+        addLog('monitor','Firestore disconnected: '+err.message+' — reconnecting...','err');
+        if(currentUnsub){ try{currentUnsub();}catch(e){} }
+        retryCount++;
+        setTimeout(attach, Math.min(5000*retryCount, 30000));
       });
-    },err=>addLog('monitor',`Firestore error: ${err.message}`,'err'));
+  }
+
+  attach();
+
+  // Heartbeat: if page has been open >2min with no snapshot, re-attach
+  // (handles cases where mobile browser suspends the tab)
+  let lastSnap=Date.now();
+  const _origAttach=attach;
+  db.collection('orders').onSnapshot(()=>{ lastSnap=Date.now(); });
+  setInterval(()=>{
+    if(Date.now()-lastSnap > 120000){
+      addLog('monitor','No snapshot in 2min — re-attaching listener','warn');
+      if(currentUnsub){ try{currentUnsub();}catch(e){} }
+      attach();
+      lastSnap=Date.now();
+    }
+  }, 60000);
 }
 
 // ── INIT ──
